@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+
+# uv / virtualenv
+.venv/
+
+# env / secrets
+.env
+
+# runtime data (cache db + logs default to ~/.ashare-mcp)
+*.db
+*.log
+.ashare-mcp/
+
+# OS
+.DS_Store

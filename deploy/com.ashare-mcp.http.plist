@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd LaunchAgent template — keep ashare-mcp running in HTTP mode at boot/login.
+
+  Install (user-level, no sudo):
+    1) Edit the paths below if your install differs (uv path, project dir, port).
+    2) Set MCP_AUTH_TOKEN to a long random secret (REQUIRED before exposing publicly).
+    3) cp deploy/com.ashare-mcp.http.plist ~/Library/LaunchAgents/
+    4) launchctl load -w ~/Library/LaunchAgents/com.ashare-mcp.http.plist
+    5) launchctl list | grep ashare-mcp          # verify it is running
+       tail -f ~/.ashare-mcp/logs/launchd.err.log # watch logs / banner
+
+  Stop / remove:
+    launchctl unload -w ~/Library/LaunchAgents/com.ashare-mcp.http.plist
+
+  Find your uv path with:  which uv   (Apple Silicon default: /Users/<you>/.local/bin/uv)
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.ashare-mcp.http</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/kylo/.local/bin/uv</string>
+    <string>--directory</string>
+    <string>/Users/kylo/Desktop/ashare-mcp</string>
+    <string>run</string>
+    <string>ashare-mcp</string>
+    <string>--transport</string>
+    <string>http</string>
+    <string>--host</string>
+    <string>127.0.0.1</string>
+    <string>--port</string>
+    <string>9876</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/Users/kylo/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <!-- Belt-and-suspenders: launchd starts processes with no locale (LANG unset).
+         Not required now that the project is on an ASCII path, but harmless and keeps
+         imports robust if you ever move it under a non-ASCII directory. -->
+    <key>PYTHONUTF8</key>
+    <string>1</string>
+    <key>LANG</key>
+    <string>en_US.UTF-8</string>
+    <key>LC_ALL</key>
+    <string>en_US.UTF-8</string>
+    <!-- REQUIRED before exposing publicly: a long random bearer token -->
+    <key>MCP_AUTH_TOKEN</key>
+    <string>CHANGE_ME_TO_A_LONG_RANDOM_TOKEN</string>
+    <key>LOG_LEVEL</key>
+    <string>INFO</string>
+    <!-- Optional: enable tushare fallback -->
+    <!-- <key>TUSHARE_TOKEN</key><string></string> -->
+  </dict>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/kylo/Desktop/ashare-mcp</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/kylo/.ashare-mcp/logs/launchd.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/kylo/.ashare-mcp/logs/launchd.err.log</string>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>
