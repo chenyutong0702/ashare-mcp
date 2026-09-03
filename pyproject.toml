@@ -7,11 +7,6 @@ requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "CharmYue" }]
 keywords = ["mcp", "akshare", "a-share", "stock", "finance", "fastmcp"]
-
-[project.urls]
-Homepage = "https://github.com/CharmYue/ashare-mcp"
-Repository = "https://github.com/CharmYue/ashare-mcp"
-Issues = "https://github.com/CharmYue/ashare-mcp/issues"
 dependencies = [
   "fastmcp>=3.0",
   "akshare>=1.18.0",
@@ -21,6 +16,11 @@ dependencies = [
   "pydantic-settings>=2.0",
   "tenacity>=8.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/CharmYue/ashare-mcp"
+Repository = "https://github.com/CharmYue/ashare-mcp"
+Issues = "https://github.com/CharmYue/ashare-mcp/issues"
 
 [project.optional-dependencies]
 tushare = ["tushare>=1.4"]
