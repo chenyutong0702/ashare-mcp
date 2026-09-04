@@ -13,9 +13,10 @@ import re
 from loguru import logger
 
 from ..app import mcp
-from ..cache import cached
+from ..cache import TTL_INFO, cached
 from ..data_sources import akshare_src as ak
-from ..data_sources._base import DataSourceError
+from ..data_sources._base import DataSourceError, DataUnavailableError
+from ..data_sources._retry import call_ak
 from ..utils import codes
 from ._helpers import guard
 
@@ -27,6 +28,43 @@ def _stock_url(code: str) -> str:
     return f"https://quote.eastmoney.com/{pre}{code}.html"
 
 
+@cached(ttl=TTL_INFO)
+def _stock_directory_rows() -> list[dict]:
+    """Return the slow-changing A-share code/name directory.
+
+    Stock identification must not depend on the market-wide realtime quote endpoint.
+    ``stock_info_a_code_name`` is much lighter and is cached for 24 hours by our
+    SQLite cache (AkShare itself also caches it in-process in current releases).
+    """
+    df = call_ak("stock_info_a_code_name")
+
+    code_col = next(
+        (col for col in ("code", "证券代码", "A股代码", "代码") if col in df.columns),
+        None,
+    )
+    name_col = next(
+        (col for col in ("name", "证券简称", "A股简称", "股票简称", "名称") if col in df.columns),
+        None,
+    )
+    if code_col is None or name_col is None:
+        raise DataUnavailableError(
+            f"stock_info_a_code_name returned unexpected columns: {list(df.columns)!r}"
+        )
+
+    rows: list[dict] = []
+    for _, row in df[[code_col, name_col]].iterrows():
+        raw_code = str(row.get(code_col) or "").strip()
+        match = re.search(r"(\d{6})", raw_code)
+        if not match:
+            continue
+        code = match.group(1)
+        name = str(row.get(name_col) or "").strip()
+        if not name or name.lower() == "nan":
+            continue
+        rows.append({"code": code, "name": name})
+    return rows
+
+
 @mcp.tool
 @guard
 @cached(ttl=60)
@@ -36,8 +74,8 @@ def search(query: str) -> dict:
     兼容 ChatGPT deep research / company knowledge。
     参数: query 关键词,可为股票代码(600519)或公司简称片段(茅台/宁德/比亚迪)。
     返回: {"results": [{"id": "stock:600519", "title": "贵州茅台 (600519)",
-            "url": "...", "snippet": "最新价/涨跌幅/换手率"}, ...]} (最多 20 条)。
-    用 results[i].id 调用 fetch 获取该股票的详细资料。
+            "url": "...", "snippet": "A股股票 | 代码 600519 | 市场 SH"}, ...]} (最多 20 条)。
+    用 results[i].id 调用 fetch 获取该股票的详细资料和实时行情。
     """
     q = str(query or "").strip()
     if not q:
@@ -48,20 +86,25 @@ def search(query: str) -> dict:
     digits = re.sub(r"\D", "", q)
 
     try:
-        rows = ak.spot_top(6000)
+        rows = _stock_directory_rows()
     except DataSourceError as e:
-        logger.warning(f"search spot fetch failed: {e}")
-        rows = []
+        logger.warning(f"search stock directory fetch failed: {e}")
+        return {"results": []}
 
     ql = q.lower()
-    # exact-code first
-    for r in rows:
-        code = str(r.get("code") or "")
-        if len(digits) >= 6 and code == digits:
-            seen.add(code)
-            results.append(_result_from_row(code, r))
-            break
 
+    # Exact six-digit code first. This also handles inputs such as 600460.SH
+    # and phrases containing a six-digit code.
+    if len(digits) >= 6:
+        exact_code = digits[:6]
+        for r in rows:
+            code = str(r.get("code") or "")
+            if code == exact_code:
+                seen.add(code)
+                results.append(_result_from_row(code, r))
+                break
+
+    # Then perform a simple substring match on code or company abbreviation.
     for r in rows:
         if len(results) >= 20:
             break
@@ -78,15 +121,12 @@ def search(query: str) -> dict:
 
 def _result_from_row(code: str, r: dict) -> dict:
     name = r.get("name") or ""
-    snippet = (
-        f"最新价 {r.get('price')} | 涨跌幅 {r.get('pct_change')}% | "
-        f"换手率 {r.get('turnover_rate')}% | 流通市值 {r.get('float_market_cap')}"
-    )
+    market = codes.market_of(code).upper()
     return {
         "id": f"stock:{code}",
         "title": f"{name} ({code})",
         "url": _stock_url(code),
-        "snippet": snippet,
+        "snippet": f"A股股票 | 代码 {code} | 市场 {market}",
     }
 
 
