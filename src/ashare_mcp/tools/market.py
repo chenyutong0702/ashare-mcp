@@ -27,6 +27,43 @@ def _fmt_min_dt(s: str, days_ago: int, end: bool) -> str:
     return s
 
 
+def _resolve_daily_range(start_date: str, end_date: str, lookback_trade_days: int = 120) -> tuple[str, str]:
+    """Resolve omitted daily-K dates to a recent, current-market window.
+
+    - end_date omitted: latest A-share trading day on/before today.
+    - start_date omitted: roughly the previous ``lookback_trade_days`` trading days.
+    - explicit dates are preserved (apart from normalizing to YYYY-MM-DD).
+    """
+    raw_start = str(start_date or "").strip()
+    raw_end = str(end_date or "").strip()
+
+    if raw_end:
+        end_ref = dates.parse_date(raw_end)
+        resolved_end = end_ref.strftime("%Y-%m-%d")
+    else:
+        end_ref = dates.latest_trade_date()
+        resolved_end = end_ref.strftime("%Y-%m-%d")
+
+    if raw_start:
+        start_ref = dates.parse_date(raw_start)
+        resolved_start = start_ref.strftime("%Y-%m-%d")
+    else:
+        trade_days = dates.recent_trade_dates(lookback_trade_days, ref=end_ref)
+        if trade_days:
+            start_ref = trade_days[0]
+        else:
+            # Defensive fallback if the exchange calendar cannot be loaded.
+            start_ref = end_ref - timedelta(days=180)
+        resolved_start = start_ref.strftime("%Y-%m-%d")
+
+    if start_ref > end_ref:
+        raise ValueError(
+            f"start_date {resolved_start} cannot be later than end_date {resolved_end}"
+        )
+
+    return resolved_start, resolved_end
+
+
 @mcp.tool
 @guard
 @cached(ttl=TTL_REALTIME)
@@ -62,8 +99,8 @@ def get_realtime_quote(symbols: list[str]) -> dict:
 @cached(ttl=ttl_daily_kline)
 def get_daily_kline(
     symbol: str,
-    start_date: str,
-    end_date: str,
+    start_date: str = "",
+    end_date: str = "",
     adjust: Literal["qfq", "hfq", ""] = "qfq",
 ) -> dict:
     """获取个股日线 K 线(前复权/后复权/不复权)。
@@ -72,19 +109,31 @@ def get_daily_kline(
     参数:
       symbol: 股票代码(多种写法均可)。
       start_date / end_date: "YYYY-MM-DD" 或 "YYYYMMDD"。
+        两者都可留空；默认自动取截至最新交易日的最近约 120 个交易日。
+        仅留空 start_date 时，会从 end_date 向前取约 120 个交易日；
+        仅留空 end_date 时，会自动使用最新交易日。
       adjust: "qfq"前复权(默认) / "hfq"后复权 / ""不复权。
     返回 data[]: date, open, high, low, close, volume, amount, amplitude(振幅%),
       pct_change(涨跌幅%), change(涨跌额), turnover_rate(换手率%)。source 标注实际取数来源。
     """
     sym = codes.normalize(symbol)
+    sd, ed = _resolve_daily_range(start_date, end_date)
     source = "akshare"
     try:
-        data = ak.daily_hist(sym, start_date, end_date, adjust)
+        data = ak.daily_hist(sym, sd, ed, adjust)
     except DataSourceError:
         source = "baostock (fallback)"
-        data = bs.daily_kline(sym, start_date, end_date, adjust)
-    return ok(data, symbol=sym, count=len(data), adjust=adjust, source=source,
-              note=DISCLAIMER_NOT_ADVICE)
+        data = bs.daily_kline(sym, sd, ed, adjust)
+    return ok(
+        data,
+        symbol=sym,
+        count=len(data),
+        adjust=adjust,
+        start=sd,
+        end=ed,
+        source=source,
+        note=DISCLAIMER_NOT_ADVICE,
+    )
 
 
 @mcp.tool
