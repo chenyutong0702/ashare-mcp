@@ -9,7 +9,8 @@ from ..app import mcp
 from ..cache import TTL_INFO, TTL_MINUTE, TTL_REALTIME, cached, ttl_daily_kline
 from ..data_sources import akshare_src as ak
 from ..data_sources import baostock_src as bs
-from ..data_sources._base import DataSourceError
+from ..data_sources import realtime_src as rt
+from ..data_sources._base import DataSourceError, DataUnavailableError
 from ..utils import codes, dates
 from ._helpers import DISCLAIMER_NOT_ADVICE, err, guard, ok
 
@@ -68,30 +69,61 @@ def _resolve_daily_range(start_date: str, end_date: str, lookback_trade_days: in
 @guard
 @cached(ttl=TTL_REALTIME)
 def get_realtime_quote(symbols: list[str]) -> dict:
-    """获取一只或多只 A 股的实时行情快照(含五档盘口)。
+    """获取一只或多只 A 股的轻量实时行情快照(含五档盘口)。
 
-    用途: 盯盘 / 报价查询。数据为东方财富实时快照,缓存 10 秒。
+    用途: 盯盘 / 报价查询。主源为腾讯财经单股/批量轻量接口，腾讯失败或漏股时
+    自动回退新浪财经；不再为了查询少量股票下载东方财富全市场 5000+ 行数据。
+    每个上游请求设置约 4.5 秒硬超时，避免数据源卡死拖到 Dify/MCP deadline。
+
     参数:
       symbols: 股票代码列表,接受 "600519" / "sh600519" / "600519.SH" 任意写法。
+
     返回 data[]: 每只股票一条,字段含 code, name, price(最新价), pct_change(涨跌幅%),
-      change(涨跌额), open, high, low, prev_close, volume(成交量), amount(成交额),
+      change(涨跌额), open, high, low, prev_close, volume(手), amount(元),
       turnover_rate(换手率%), volume_ratio(量比), pe_ttm, pb, total_market_cap,
-      float_market_cap, 以及 bid_ask(五档盘口: bid_1..bid_5 / ask_1..ask_5 等)。
+      float_market_cap, quote_time, is_realtime, source, 以及 bid_ask 五档盘口。
+
+    若腾讯不可用会自动尝试新浪；若两者都不可用则快速返回 data_source_unavailable，
+    调用方应改用 get_daily_kline 的最新交易日收盘数据，而不是长时间等待。
     """
     if not symbols:
         return err("bad_request", "symbols 不能为空", "示例: ['600519','000001']")
-    quotes = ak.spot_lookup(symbols)
-    by_code = {str(q.get("code")): q for q in quotes}
+
+    quotes, provider_errors = rt.realtime_quotes(symbols)
+    if not quotes:
+        detail = "; ".join(provider_errors) or "Tencent/Sina returned no quote rows"
+        raise DataUnavailableError(detail)
+
     out: list[dict] = []
-    for s in symbols:
-        code = codes.normalize(s)
-        row = dict(by_code.get(code, {"code": code, "name": None}))
-        try:
-            row["bid_ask"] = ak.bid_ask(code)
-        except DataSourceError:
-            row["bid_ask"] = None
-        out.append(row)
-    return ok(out, count=len(out), source="akshare / 东方财富", note=DISCLAIMER_NOT_ADVICE)
+    missing_symbols: list[str] = []
+    for symbol in symbols:
+        code = codes.normalize(symbol)
+        row = quotes.get(code)
+        if row is None:
+            missing_symbols.append(code)
+            row = {
+                "code": code,
+                "name": None,
+                "price": None,
+                "quote_time": None,
+                "is_realtime": False,
+                "source": None,
+                "error": "quote_unavailable",
+            }
+        out.append(dict(row))
+
+    providers_used = sorted(
+        {str(row.get("source")) for row in out if row.get("source")}
+    )
+    return ok(
+        out,
+        count=len(out),
+        source=" + ".join(providers_used) or "Tencent/Sina realtime",
+        provider_errors=provider_errors,
+        missing_symbols=missing_symbols,
+        units={"volume": "hand", "bid_ask_volume": "hand", "amount": "CNY", "market_cap": "CNY"},
+        note=DISCLAIMER_NOT_ADVICE,
+    )
 
 
 @mcp.tool
