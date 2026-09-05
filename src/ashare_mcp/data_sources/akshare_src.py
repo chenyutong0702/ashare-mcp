@@ -11,6 +11,31 @@ from ._base import DataUnavailableError, df_kv_to_dict, df_to_records
 from ._retry import call_ak
 from ..utils import codes, dates
 
+# Fragile Eastmoney analytics endpoints should never be allowed to consume the whole
+# Dify/MCP deadline. One short attempt is enough; the tool layer will return a clean
+# data_source_unavailable result and the agent can continue with other evidence.
+FAST_EM_TIMEOUT_SECONDS = 7.0
+SLOW_EM_TIMEOUT_SECONDS = 15.0
+
+
+def _call_em_fast(candidates: str | list[str], **kwargs):
+    return call_ak(
+        candidates,
+        timeout_seconds=FAST_EM_TIMEOUT_SECONDS,
+        attempts=1,
+        **kwargs,
+    )
+
+
+def _call_em_slow(candidates: str | list[str], **kwargs):
+    return call_ak(
+        candidates,
+        timeout_seconds=SLOW_EM_TIMEOUT_SECONDS,
+        attempts=1,
+        **kwargs,
+    )
+
+
 # ---- per-call rename overrides (where COLUMN_MAP needs help) ----
 _BID_ASK_RENAME = {
     "买一": "bid_1", "买二": "bid_2", "买三": "bid_3", "买四": "bid_4", "买五": "bid_5",
@@ -78,7 +103,7 @@ def minute_hist(
 # B. Fund flow
 # --------------------------------------------------------------------------- #
 def individual_fund_flow(symbol: str) -> list[dict]:
-    df = call_ak(
+    df = _call_em_fast(
         "stock_individual_fund_flow",
         stock=codes.normalize(symbol),
         market=codes.market_of(symbol),
@@ -87,17 +112,21 @@ def individual_fund_flow(symbol: str) -> list[dict]:
 
 
 def market_fund_flow() -> list[dict]:
-    df = call_ak("stock_market_fund_flow")
+    df = _call_em_fast("stock_market_fund_flow")
     return df_to_records(df)
 
 
 def sector_fund_flow_rank(indicator: str, sector_type: str, limit: int | None = None) -> list[dict]:
-    df = call_ak("stock_sector_fund_flow_rank", indicator=indicator, sector_type=sector_type)
+    df = _call_em_fast(
+        "stock_sector_fund_flow_rank",
+        indicator=indicator,
+        sector_type=sector_type,
+    )
     return df_to_records(df, limit=limit)
 
 
 def main_fund_flow_rank(symbol: str = "全部股票", limit: int | None = None) -> list[dict]:
-    df = call_ak("stock_main_fund_flow", symbol=symbol)
+    df = _call_em_fast("stock_main_fund_flow", symbol=symbol)
     return df_to_records(df, limit=limit)
 
 
@@ -105,7 +134,7 @@ def main_fund_flow_rank(symbol: str = "全部股票", limit: int | None = None) 
 # C. LHB (dragon-tiger list)
 # --------------------------------------------------------------------------- #
 def lhb_detail(start_date: str, end_date: str, limit: int | None = None) -> list[dict]:
-    df = call_ak(
+    df = _call_em_fast(
         "stock_lhb_detail_em",
         start_date=dates.to_compact(start_date),
         end_date=dates.to_compact(end_date),
@@ -114,7 +143,7 @@ def lhb_detail(start_date: str, end_date: str, limit: int | None = None) -> list
 
 
 def lhb_stock_detail(symbol: str, date: str, flag: str) -> list[dict]:
-    df = call_ak(
+    df = _call_em_fast(
         "stock_lhb_stock_detail_em",
         symbol=codes.normalize(symbol),
         date=dates.to_compact(date),
@@ -124,7 +153,7 @@ def lhb_stock_detail(symbol: str, date: str, flag: str) -> list[dict]:
 
 
 def lhb_institution_daily(start_date: str, end_date: str, limit: int | None = None) -> list[dict]:
-    df = call_ak(
+    df = _call_em_fast(
         "stock_lhb_jgmmtj_em",
         start_date=dates.to_compact(start_date),
         end_date=dates.to_compact(end_date),
@@ -133,7 +162,7 @@ def lhb_institution_daily(start_date: str, end_date: str, limit: int | None = No
 
 
 def lhb_active_branches(start_date: str, end_date: str, limit: int | None = None) -> list[dict]:
-    df = call_ak(
+    df = _call_em_fast(
         "stock_lhb_hyyyb_em",
         start_date=dates.to_compact(start_date),
         end_date=dates.to_compact(end_date),
@@ -201,7 +230,7 @@ def northbound_holdings(symbol: str, limit: int | None = None) -> list[dict]:
 # F. Chip distribution
 # --------------------------------------------------------------------------- #
 def chip_distribution(symbol: str, adjust: str = "", limit: int | None = None) -> list[dict]:
-    df = call_ak("stock_cyq_em", symbol=codes.normalize(symbol), adjust=adjust or "")
+    df = _call_em_fast("stock_cyq_em", symbol=codes.normalize(symbol), adjust=adjust or "")
     return df_to_records(df, limit=limit)
 
 
@@ -285,18 +314,23 @@ def research_reports(symbol: str, limit: int = 10) -> list[dict]:
 # H. Meta / sentiment
 # --------------------------------------------------------------------------- #
 def zt_pool(date: str, limit: int | None = None) -> list[dict]:
-    df = call_ak("stock_zt_pool_em", date=dates.to_compact(date))
+    df = _call_em_fast("stock_zt_pool_em", date=dates.to_compact(date))
     return df_to_records(df, limit=limit)
 
 
 def stock_comment_all(limit: int | None = None) -> list[dict]:
-    df = call_ak("stock_comment_em")
+    # stock_comment_em paginates across the whole market, so allow a little more time
+    # than the other Eastmoney analytics calls, but never let it run unbounded.
+    df = _call_em_slow("stock_comment_em")
     return df_to_records(df, limit=limit)
 
 
 def stock_comment_one(symbol: str) -> dict:
     code = codes.normalize(symbol)
-    df = call_ak("stock_comment_em")
+    # AkShare currently exposes 千股千评 as a market-wide paginated endpoint. Keep the
+    # same semantics but cap the total wait so a slow Eastmoney response cannot take
+    # down the Dify agent.
+    df = _call_em_slow("stock_comment_em")
     code_col = "代码" if "代码" in df.columns else df.columns[1]
     sub = df[df[code_col].astype(str) == code]
     recs = df_to_records(sub)
