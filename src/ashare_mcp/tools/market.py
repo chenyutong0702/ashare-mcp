@@ -79,7 +79,7 @@ def get_realtime_quote(symbols: list[str]) -> dict:
       symbols: 股票代码列表,接受 "600519" / "sh600519" / "600519.SH" 任意写法。
 
     返回 data[]: 每只股票一条,字段含 code, name, price(最新价), pct_change(涨跌幅%),
-      change(涨跌额), open, high, low, prev_close, volume(股), amount(元),
+      change(涨跌额), open, high, low, prev_close, volume(手), amount(元),
       turnover_rate(换手率%), volume_ratio(量比), pe_ttm, pb, total_market_cap,
       float_market_cap, quote_time, is_realtime, source, 以及 bid_ask 五档盘口。
 
@@ -121,7 +121,7 @@ def get_realtime_quote(symbols: list[str]) -> dict:
         source=" + ".join(providers_used) or "Tencent/Sina realtime",
         provider_errors=provider_errors,
         missing_symbols=missing_symbols,
-        units={"volume": "share", "amount": "CNY", "market_cap": "CNY"},
+        units={"volume": "hand", "bid_ask_volume": "hand", "amount": "CNY", "market_cap": "CNY"},
         note=DISCLAIMER_NOT_ADVICE,
     )
 
