@@ -7,6 +7,7 @@ from typing import Literal
 from ..app import mcp
 from ..utils import codes
 from . import technical
+from ._valuation import get_valuation
 from .fundflow import get_individual_fund_flow
 from ._helpers import DISCLAIMER_FUNDFLOW, err, guard, ok
 
@@ -61,13 +62,17 @@ def _sentiment(data, flow, as_of):
 def technical_sentiment_analysis(
     symbol: str, period: Literal["daily"] = "daily", lookback: int = 120,
 ) -> dict:
-    """统一技术分析+市场情绪。复用现有技术与资金流工具，原工具保持兼容。
+    """统一技术分析+市场情绪+历史估值。复用现有数据源，原工具保持兼容。
 
     symbol: 600519 / sh600519 / 600519.SH。period: 当前仅支持daily。
     lookback: 80-250个交易日，默认120。返回data.technical(均线、MACD、RSI、
     KDJ、BOLL、ATR、量价、支撑压力、交叉和超买超卖)、sentiment、risk_flags、
     technical_score、sentiment_score、overall_signal、summary。缺失项null/unavailable。
     评分0-100为启发式强弱分，不是上涨概率。资金流只采用与K线末日一致的数据。
+    新增data.valuation: current.pe_ttm/pb/ps_ttm；history.pe_1y/3y/5y_percentile、
+    pb_1y/3y/5y_percentile；windows各期限min/median/max/p25/p75及样本覆盖；
+    valuation_signal、source、point_in_time、reasons。估值截至已完成K线末日，
+    默认最多5年，与技术lookback独立；缺失null/unavailable，不影响原评分。
     """
     if period != "daily" or isinstance(lookback, bool) or not isinstance(lookback, int) or not 80 <= lookback <= 250:
         return err("bad_request", "period must be daily; lookback must be an integer in 80..250")
@@ -102,6 +107,7 @@ def technical_sentiment_analysis(
     signal = "unavailable" if combined is None else "偏强" if combined >= 60 else "偏弱" if combined <= 40 else "中性"
     return ok({
         "technical": data, "sentiment": sentiment,
+        "valuation": get_valuation(sym, as_of),
         "technical_score": technical_score, "sentiment_score": sentiment_score,
         "overall_signal": signal, "risk_flags": list(dict.fromkeys(flags)),
         "summary": f"日线技术与情绪综合{signal}；情绪为行情与资金流代理。",
@@ -109,5 +115,3 @@ def technical_sentiment_analysis(
     }, symbol=sym, period=period, lookback=lookback, as_of=as_of,
         source={"technical": result.get("source"), "fund_flow": flow.get("source")},
         disclaimer=DISCLAIMER_FUNDFLOW)
-
-

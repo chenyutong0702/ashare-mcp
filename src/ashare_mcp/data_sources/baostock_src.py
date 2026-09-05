@@ -88,3 +88,21 @@ def financial(symbol: str, report_type: str, year: int, quarter: int) -> list[di
         rs = fn(code=codes.to_baostock(symbol), year=year, quarter=quarter)
         df = _rs_to_df(rs)
     return df_to_records(df)
+
+
+def valuation_history(symbol: str, start_date: str, end_date: str) -> list[dict]:
+    """Provider daily ratios; no reconstruction using today's financial statements."""
+    import pandas as pd
+
+    with _lock:
+        bs = _login()
+        rs = bs.query_history_k_data_plus(
+            codes.to_baostock(symbol), "date,close,peTTM,pbMRQ,psTTM,tradestatus",
+            start_date=dates.to_dashed(start_date), end_date=dates.to_dashed(end_date),
+            frequency="d", adjustflag="3",
+        )
+        df = _rs_to_df(rs)
+    df = df[df["tradestatus"].astype(str) == "1"].copy()
+    for col in ("close", "peTTM", "pbMRQ", "psTTM"):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df_to_records(df, rename={"peTTM": "pe_ttm", "pbMRQ": "pb", "psTTM": "ps_ttm"})

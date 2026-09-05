@@ -1,5 +1,54 @@
 # ashare-mcp
 
+## Unified valuation extension
+
+`technical_sentiment_analysis(symbol, period="daily", lookback=120)` now also returns
+`data.valuation`; the three inputs, all prior tools and technical/sentiment/overall
+scores are unchanged. No separate MCP server or valuation tool is registered.
+
+- `current.pe_ttm`, `current.pb`, `current.ps_ttm`: latest **completed analysis bar**
+  ratios, not a newer intraday snapshot. Missing/nonpositive values are null.
+- `history.pe_1y_percentile`, `pe_3y_percentile`, `pe_5y_percentile` and corresponding
+  `pb_*`: calendar-window percentiles, on a 0–100 scale.
+- `history.windows.1y/3y/5y.pe/pb`: min, p25, median, p75, max, percentile, count,
+  actual start/end and coverage status. Flat `history.pe_min/median/max/p25/p75`
+  and `pb_*` alias the available five-year-window statistics (possibly partial).
+- `valuation_signal`: longest common adequately covered PE/PB window; both
+  percentiles <=25 means historically_low, both >=75 historically_high, otherwise
+  neutral. Missing coverage yields unavailable. No valuation_score is introduced.
+- `source`, `method`, `point_in_time`, `reasons`, `peers` explain provenance/limits.
+
+The existing Baostock connection supplies daily `peTTM/pbMRQ/psTTM`, queried with
+unadjusted prices and trading-status filtering. These are provider-reported daily
+ratios: the service does **not** certify that the provider has never revised past
+values. See [the provider's package example](https://pypi.org/project/baostock/).
+No present-day EPS or book value is backfilled into historical dates.
+
+If the sequence is unavailable, existing unadjusted K-line and financial adapters
+are attempted. Reconstruction requires date-specific market cap in CNY plus
+disclosure-versioned parent income/equity. TTM = prior annual + current YTD - prior
+YTD; annual reports use annual earnings. Date-only disclosures become usable on
+the following trading date. Revised financial snapshots use the later notice/update
+date, not their original release date. Current shares, weighted EPS and adjusted
+prices are never substituted. Existing K-line adapters normally lack historical
+market cap: in that case reconstruction honestly returns null, with the reason.
+Peer comparisons remain unavailable because no verified comparable peer adapter
+exists. No new provider credentials or dependencies are required.
+
+Percentiles use mid-rank ties: 100*(less + 0.5*equal)/N. Only positive finite ratios
+are included. Each named full-window percentile requires >=120*y valid observations,
+the first within 14 calendar days of the window start and the last on analysis date.
+Partial sample statistics are still exposed with insufficient_history status.
+Valuation provider work has a 12-second foreground deadline, a single-worker gate,
+and a five-minute cache; provider failures do not remove the other analysis fields.
+
+After deployment, refresh the existing MCP connection in Dify. The same tool's
+description advertises valuation; calling it with `{"symbol":"600196.SH"}` exposes
+the new fields in the returned JSON, not as additional input parameters.
+
+Focused offline verification: `python -m pytest tests/test_valuation.py
+tests/test_technical_sentiment.py tests/test_technical_analysis.py`.
+
 生产级**中国 A 股数据 MCP server**,基于 [fastmcp](https://gofastmcp.com) 3.x +
 [akshare](https://akshare.akfamily.xyz)。一份代码同时支持 **stdio** 与 **Streamable HTTP**
 两种传输,可作为常驻服务接入 Claude Desktop / Claude Code / Claude.ai / ChatGPT。

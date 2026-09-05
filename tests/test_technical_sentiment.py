@@ -17,6 +17,7 @@ def test_zero_is_not_missing():
 
 
 def test_full_tool(monkeypatch):
+    monkeypatch.setattr(mod, "get_valuation", lambda *a: {"status": "unavailable", "current": {"pe_ttm": None}})
     rows = _sample_rows()
     monkeypatch.setattr(mod.technical, "_load_daily", lambda *a: (rows, "fixture", rows[0]["date"], rows[-1]["date"]))
     monkeypatch.setattr(mod.technical, "_realtime_overlay", lambda *a: ({"volume_ratio": 1.4, "turnover_rate": 3}, []))
@@ -25,6 +26,7 @@ def test_full_tool(monkeypatch):
     assert r["ok"], r
     assert r["data"]["sentiment"]["turnover_rate"] == 3
     assert 0 <= r["data"]["technical_score"] <= 100
+    assert r["data"]["valuation"]["current"]["pe_ttm"] is None
     json.dumps(r, allow_nan=False)
 
 
