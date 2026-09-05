@@ -1,14 +1,18 @@
-"""Retry decorator for akshare calls + a name-resolving ``call_ak`` helper.
+"""Retry helpers for AkShare calls plus optional hard per-call deadlines.
 
-Retries network-ish failures (and empty responses) up to 3 attempts with exponential
-backoff (1s, 2s) then re-raises so the tool layer can fall back to baostock/tushare.
-``call_ak`` accepts a list of candidate function names so the server keeps working
-across akshare versions that rename interfaces.
+Most AkShare interfaces are normal request/response calls, but a few Eastmoney
+endpoints can occasionally leave an HTTP request hanging long enough to hit the
+outer Dify/MCP deadline. ``call_ak`` therefore supports an opt-in hard timeout and
+custom retry count. Normal calls keep the existing three-attempt behaviour; fragile
+interactive endpoints can request one short attempt and fail gracefully instead of
+blocking the whole agent.
 """
 
 from __future__ import annotations
 
 import functools
+import queue
+import threading
 import time
 from typing import Callable
 
@@ -41,13 +45,15 @@ def _log_before_sleep(state) -> None:
     )
 
 
-def akshare_retry(fn: Callable) -> Callable:
-    """Wrap a callable with the standard akshare retry policy (3 attempts, 1s/2s backoff)."""
+def akshare_retry(fn: Callable, *, attempts: int = 3) -> Callable:
+    """Wrap a callable with the standard AkShare retry policy."""
+
+    attempt_count = max(1, int(attempts))
 
     @functools.wraps(fn)
     @retry(
         reraise=True,
-        stop=stop_after_attempt(3),
+        stop=stop_after_attempt(attempt_count),
         wait=wait_exponential(multiplier=1, min=1, max=4),
         retry=retry_if_exception_type(RETRYABLE),
         before_sleep=_log_before_sleep,
@@ -68,8 +74,71 @@ def _resolve(candidates: list[str]):
     return None, None
 
 
-def call_ak(candidates: str | list[str], *, empty_ok: bool = False, **kwargs) -> pd.DataFrame:
-    """Call the first existing akshare function among ``candidates`` with retry.
+def _invoke_with_timeout(
+    fn: Callable,
+    kwargs: dict,
+    *,
+    timeout_seconds: float | None,
+    call_name: str,
+):
+    """Invoke a blocking provider call with an optional hard deadline.
+
+    A daemon thread is intentional here: Python cannot safely kill a blocked requests
+    call in another thread, but the MCP request must still be allowed to return. The
+    fragile endpoints use a single attempt, so at most one abandoned daemon thread is
+    left behind for a timed-out invocation and it disappears once the upstream socket
+    eventually unwinds.
+    """
+    if timeout_seconds is None:
+        return fn(**kwargs)
+
+    timeout = float(timeout_seconds)
+    if timeout <= 0:
+        return fn(**kwargs)
+
+    result_queue: queue.Queue[tuple[bool, object]] = queue.Queue(maxsize=1)
+
+    def runner() -> None:
+        try:
+            result_queue.put((True, fn(**kwargs)))
+        except Exception as exc:  # noqa: BLE001 - re-raised in caller thread
+            try:
+                result_queue.put((False, exc))
+            except queue.Full:
+                pass
+
+    thread = threading.Thread(
+        target=runner,
+        name=f"akshare-{call_name}",
+        daemon=True,
+    )
+    thread.start()
+
+    try:
+        succeeded, payload = result_queue.get(timeout=timeout)
+    except queue.Empty as exc:
+        raise TimeoutError(f"{call_name} exceeded hard timeout {timeout:.1f}s") from exc
+
+    if succeeded:
+        return payload
+    if isinstance(payload, Exception):
+        raise payload
+    raise RuntimeError(f"{call_name} failed without an exception payload")
+
+
+def call_ak(
+    candidates: str | list[str],
+    *,
+    empty_ok: bool = False,
+    timeout_seconds: float | None = None,
+    attempts: int = 3,
+    **kwargs,
+) -> pd.DataFrame:
+    """Call the first existing AkShare function among ``candidates``.
+
+    ``timeout_seconds`` is an optional hard per-attempt deadline. ``attempts`` defaults
+    to three for ordinary calls; latency-sensitive Eastmoney endpoints can use one
+    attempt so they fail fast and let the MCP return a structured unavailable result.
 
     Raises :class:`DataUnavailableError` if none of the names exist, or
     :class:`EmptyDataError` if the call returns nothing (unless ``empty_ok``).
@@ -81,10 +150,14 @@ def call_ak(candidates: str | list[str], *, empty_ok: bool = False, **kwargs) ->
             f"akshare exposes none of {names} (version {_akversion()}); interface may be renamed"
         )
 
-    @akshare_retry
     def _do() -> pd.DataFrame:
         t0 = time.time()
-        df = fn(**kwargs)
+        df = _invoke_with_timeout(
+            fn,
+            kwargs,
+            timeout_seconds=timeout_seconds,
+            call_name=name,
+        )
         dt = (time.time() - t0) * 1000
         n = 0 if df is None else (len(df) if hasattr(df, "__len__") else 1)
         logger.debug(f"akshare {name}({_fmt_kwargs(kwargs)}) -> {n} rows in {dt:.0f}ms")
@@ -95,20 +168,15 @@ def call_ak(candidates: str | list[str], *, empty_ok: bool = False, **kwargs) ->
         return df
 
     try:
-        return _do()
+        return akshare_retry(_do, attempts=attempts)()
     except EmptyDataError:
         raise  # already a DataSourceError -> tools treat as no_data
     except (ConnectionError, TimeoutError, RequestException) as e:
-        # Network failure after retries. Re-raise as DataSourceError so (a) tools with a
-        # fallback (kline/financials -> baostock/tushare) actually trigger it, and (b) the
-        # @guard layer reports data_source_unavailable (per PRD) instead of internal_error.
         raise DataUnavailableError(f"{name} network failure after retries: {e}") from e
     except (KeyError, IndexError, TypeError, AttributeError, ValueError) as e:
-        # The only call inside _do() is the akshare function, so any of these comes from
-        # akshare's INTERNAL parsing (an upstream format change, or a proxy/error page
-        # returning non-JSON so akshare subscripts a None). Treat as an unavailable source,
-        # not a caller bad_request — keeps degradation graceful and triggers fallbacks.
-        raise DataUnavailableError(f"{name} upstream parse failure ({type(e).__name__}: {e})") from e
+        raise DataUnavailableError(
+            f"{name} upstream parse failure ({type(e).__name__}: {e})"
+        ) from e
 
 
 def _fmt_kwargs(kwargs: dict) -> str:
