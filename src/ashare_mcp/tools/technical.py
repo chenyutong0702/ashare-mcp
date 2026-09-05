@@ -1,0 +1,763 @@
+"""Deterministic A-share technical-analysis tool.
+
+The tool turns recent daily bars plus an optional lightweight realtime quote into a
+structured technical snapshot. It intentionally separates observed indicators from
+heuristic interpretation: the score / emotion phase are descriptive aids, not a
+price forecast or trading signal.
+"""
+
+from __future__ import annotations
+
+from datetime import timedelta
+from typing import Any
+
+import pandas as pd
+
+from ..app import mcp
+from ..cache import TTL_MINUTE, cached
+from ..data_sources import baostock_src as bs
+from ..data_sources import realtime_src as rt
+from ..data_sources._base import DataSourceError, df_to_records
+from ..data_sources._retry import call_ak
+from ..utils import codes, dates
+from ._helpers import DISCLAIMER_NOT_ADVICE, err, guard, ok
+
+_MIN_LOOKBACK = 80
+_MAX_LOOKBACK = 250
+_DAILY_TIMEOUT_SECONDS = 8.0
+
+
+def _num(value: Any, digits: int = 4) -> float | None:
+    try:
+        if value is None or pd.isna(value):
+            return None
+        return round(float(value), digits)
+    except (TypeError, ValueError):
+        return None
+
+
+def _clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def _prepare_frame(rows: list[dict]) -> pd.DataFrame:
+    if not rows:
+        raise ValueError("daily kline is empty")
+    df = pd.DataFrame(rows).copy()
+    required = {"date", "open", "high", "low", "close"}
+    missing = required.difference(df.columns)
+    if missing:
+        raise ValueError(f"daily kline missing columns: {sorted(missing)}")
+
+    for col in ("open", "high", "low", "close", "volume", "amount", "pct_change"):
+        if col not in df.columns:
+            df[col] = None
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["date", "open", "high", "low", "close"])
+    df = df.sort_values("date").drop_duplicates(subset=["date"], keep="last")
+    df = df.reset_index(drop=True)
+    if len(df) < 35:
+        raise ValueError(f"insufficient daily bars: {len(df)} (need >=35)")
+    return df
+
+
+def _add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    close = out["close"]
+    high = out["high"]
+    low = out["low"]
+    volume = out["volume"].fillna(0.0)
+
+    for window in (5, 10, 20, 60):
+        out[f"ma{window}"] = close.rolling(window).mean()
+    out["ma20_slope_5d_pct"] = (out["ma20"] / out["ma20"].shift(5) - 1.0) * 100.0
+    out["ma60_slope_5d_pct"] = (out["ma60"] / out["ma60"].shift(5) - 1.0) * 100.0
+
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
+    out["macd_dif"] = ema12 - ema26
+    out["macd_dea"] = out["macd_dif"].ewm(span=9, adjust=False).mean()
+    out["macd_hist"] = (out["macd_dif"] - out["macd_dea"]) * 2.0
+
+    delta = close.diff()
+    gain = delta.clip(lower=0.0)
+    loss = -delta.clip(upper=0.0)
+    avg_gain = gain.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
+    avg_loss = loss.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
+    rs = avg_gain / avg_loss.replace(0, pd.NA)
+    out["rsi14"] = 100.0 - (100.0 / (1.0 + rs))
+    out.loc[(avg_loss == 0) & (avg_gain > 0), "rsi14"] = 100.0
+
+    low9 = low.rolling(9).min()
+    high9 = high.rolling(9).max()
+    rsv = (close - low9) / (high9 - low9).replace(0, pd.NA) * 100.0
+    out["kdj_k"] = rsv.ewm(alpha=1 / 3, adjust=False).mean()
+    out["kdj_d"] = out["kdj_k"].ewm(alpha=1 / 3, adjust=False).mean()
+    out["kdj_j"] = 3.0 * out["kdj_k"] - 2.0 * out["kdj_d"]
+
+    out["boll_mid"] = close.rolling(20).mean()
+    boll_std = close.rolling(20).std(ddof=0)
+    out["boll_upper"] = out["boll_mid"] + 2.0 * boll_std
+    out["boll_lower"] = out["boll_mid"] - 2.0 * boll_std
+    out["boll_width_pct"] = (
+        (out["boll_upper"] - out["boll_lower"]) / out["boll_mid"] * 100.0
+    )
+
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [
+            high - low,
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    out["atr14"] = tr.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
+    out["atr14_pct"] = out["atr14"] / close * 100.0
+
+    out["volume_ma5"] = volume.rolling(5).mean()
+    out["volume_ma20"] = volume.rolling(20).mean()
+    out["volume_ma20_prior"] = volume.shift(1).rolling(20).mean()
+    out["volume_ratio_20"] = volume / out["volume_ma20_prior"].replace(0, pd.NA)
+
+    for window in (5, 20, 60):
+        out[f"return_{window}d_pct"] = (close / close.shift(window) - 1.0) * 100.0
+        rolling_high = high.rolling(window).max()
+        rolling_low = low.rolling(window).min()
+        out[f"position_{window}d"] = (
+            (close - rolling_low) / (rolling_high - rolling_low).replace(0, pd.NA)
+        )
+
+    out["prev_20d_high"] = high.shift(1).rolling(20).max()
+    out["prev_20d_low"] = low.shift(1).rolling(20).min()
+    out["prev_60d_high"] = high.shift(1).rolling(60).max()
+    out["prev_60d_low"] = low.shift(1).rolling(60).min()
+
+    if "pct_change" in out.columns:
+        computed_pct = close.pct_change() * 100.0
+        out["pct_change"] = out["pct_change"].fillna(computed_pct)
+    return out
+
+
+def _recent_pivots(df: pd.DataFrame, window: int = 60) -> tuple[list[float], list[float]]:
+    recent = df.tail(window).reset_index(drop=True)
+    lows: list[float] = []
+    highs: list[float] = []
+    if len(recent) < 5:
+        return lows, highs
+    for idx in range(2, len(recent) - 2):
+        low_slice = recent.loc[idx - 2 : idx + 2, "low"]
+        high_slice = recent.loc[idx - 2 : idx + 2, "high"]
+        low_value = float(recent.loc[idx, "low"])
+        high_value = float(recent.loc[idx, "high"])
+        if low_value <= float(low_slice.min()):
+            lows.append(low_value)
+        if high_value >= float(high_slice.max()):
+            highs.append(high_value)
+    return lows[-4:], highs[-4:]
+
+
+def _cluster_levels(candidates: list[tuple[float | None, str]]) -> list[dict]:
+    levels: list[dict] = []
+    for raw_value, basis in candidates:
+        value = _num(raw_value, 4)
+        if value is None or value <= 0:
+            continue
+        merged = False
+        for item in levels:
+            if abs(value - item["level"]) / item["level"] <= 0.012:
+                old_count = len(item["basis"])
+                item["level"] = round((item["level"] * old_count + value) / (old_count + 1), 4)
+                item["basis"].append(basis)
+                merged = True
+                break
+        if not merged:
+            levels.append({"level": value, "basis": [basis]})
+    return levels
+
+
+def _support_resistance(
+    df: pd.DataFrame,
+    current_price: float,
+    atr: float | None,
+) -> tuple[list[dict], list[dict]]:
+    latest = df.iloc[-1]
+    pivot_lows, pivot_highs = _recent_pivots(df)
+
+    base_candidates: list[tuple[float | None, str]] = [
+        (_num(latest.get("ma20")), "MA20"),
+        (_num(latest.get("ma60")), "MA60"),
+        (_num(latest.get("prev_20d_low")), "20日区间低点"),
+        (_num(latest.get("prev_20d_high")), "20日区间高点"),
+        (_num(latest.get("prev_60d_low")), "60日区间低点"),
+        (_num(latest.get("prev_60d_high")), "60日区间高点"),
+    ]
+    base_candidates.extend((value, "近期摆动低点") for value in pivot_lows)
+    base_candidates.extend((value, "近期摆动高点") for value in pivot_highs)
+
+    clustered = _cluster_levels(base_candidates)
+    support = [item for item in clustered if item["level"] < current_price]
+    resistance = [item for item in clustered if item["level"] > current_price]
+    support.sort(key=lambda item: item["level"], reverse=True)
+    resistance.sort(key=lambda item: item["level"])
+
+    def with_zone(item: dict) -> dict:
+        level = float(item["level"])
+        half_width = max(level * 0.004, (atr or 0.0) * 0.25)
+        return {
+            "level": round(level, 4),
+            "zone": [round(level - half_width, 4), round(level + half_width, 4)],
+            "basis": item["basis"],
+            "distance_pct": round((level / current_price - 1.0) * 100.0, 2),
+        }
+
+    return [with_zone(x) for x in support[:3]], [with_zone(x) for x in resistance[:3]]
+
+
+def _rsi_divergence(df: pd.DataFrame) -> str | None:
+    recent = df.tail(30).dropna(subset=["rsi14", "close"])
+    if len(recent) < 20:
+        return None
+    midpoint = len(recent) // 2
+    first = recent.iloc[:midpoint]
+    second = recent.iloc[midpoint:]
+
+    first_high_idx = first["close"].idxmax()
+    second_high_idx = second["close"].idxmax()
+    first_low_idx = first["close"].idxmin()
+    second_low_idx = second["close"].idxmin()
+
+    first_high = float(recent.loc[first_high_idx, "close"])
+    second_high = float(recent.loc[second_high_idx, "close"])
+    first_high_rsi = float(recent.loc[first_high_idx, "rsi14"])
+    second_high_rsi = float(recent.loc[second_high_idx, "rsi14"])
+
+    if second_high >= first_high * 1.01 and second_high_rsi <= first_high_rsi - 5.0:
+        return "bearish"
+
+    first_low = float(recent.loc[first_low_idx, "close"])
+    second_low = float(recent.loc[second_low_idx, "close"])
+    first_low_rsi = float(recent.loc[first_low_idx, "rsi14"])
+    second_low_rsi = float(recent.loc[second_low_idx, "rsi14"])
+    if second_low <= first_low * 0.99 and second_low_rsi >= first_low_rsi + 5.0:
+        return "bullish"
+    return None
+
+
+def _volume_price_label(pct_change: float | None, volume_ratio: float | None) -> str:
+    pct = pct_change or 0.0
+    vr = volume_ratio
+    if vr is None:
+        return "量能数据不足"
+    if pct >= 0.5 and vr >= 1.3:
+        return "放量上涨"
+    if pct >= 0.5 and vr <= 0.8:
+        return "缩量上涨"
+    if pct <= -0.5 and vr >= 1.3:
+        return "放量下跌"
+    if pct <= -0.5 and vr <= 0.8:
+        return "缩量下跌"
+    if abs(pct) < 0.5 and vr >= 1.3:
+        return "放量震荡"
+    return "量价中性"
+
+
+def _trend_label(latest: pd.Series, price: float) -> str:
+    ma20 = _num(latest.get("ma20"))
+    ma60 = _num(latest.get("ma60"))
+    slope20 = _num(latest.get("ma20_slope_5d_pct"))
+    if ma20 is None or ma60 is None:
+        return "数据不足"
+    if price > ma20 > ma60 and (slope20 or 0.0) > 0:
+        return "强"
+    if price > ma20 and (slope20 or 0.0) >= 0:
+        return "偏强"
+    if price < ma20 < ma60 and (slope20 or 0.0) < 0:
+        return "弱"
+    if price < ma20 and (slope20 or 0.0) <= 0:
+        return "偏弱"
+    return "震荡"
+
+
+def _score_snapshot(
+    latest: pd.Series,
+    previous: pd.Series,
+    price: float,
+    breakout: bool,
+    failed_breakout: bool,
+    divergence: str | None,
+) -> tuple[int, str, dict]:
+    ma20 = _num(latest.get("ma20"))
+    ma60 = _num(latest.get("ma60"))
+    slope20 = _num(latest.get("ma20_slope_5d_pct"))
+    hist = _num(latest.get("macd_hist"))
+    prev_hist = _num(previous.get("macd_hist"))
+    rsi = _num(latest.get("rsi14"))
+    k = _num(latest.get("kdj_k"))
+    d = _num(latest.get("kdj_d"))
+    pct = _num(latest.get("pct_change"))
+    volume_ratio = _num(latest.get("volume_ratio_20"))
+    position60 = _num(latest.get("position_60d"))
+    atr_pct = _num(latest.get("atr14_pct"))
+
+    trend = 15.0
+    if ma20 is not None:
+        trend += 5.0 if price > ma20 else -5.0
+    if ma20 is not None and ma60 is not None:
+        trend += 5.0 if ma20 > ma60 else -5.0
+    if slope20 is not None:
+        trend += 5.0 if slope20 > 0 else -5.0
+    trend = _clamp(trend, 0.0, 30.0)
+
+    momentum = 12.0
+    if hist is not None:
+        momentum += 5.0 if hist > 0 else -5.0
+    if hist is not None and prev_hist is not None:
+        momentum += 3.0 if hist > prev_hist else -3.0
+    if rsi is not None:
+        if 50 <= rsi <= 70:
+            momentum += 3.0
+        elif rsi < 40:
+            momentum -= 3.0
+        elif rsi > 80:
+            momentum -= 2.0
+    if k is not None and d is not None:
+        momentum += 2.0 if k > d else -2.0
+    momentum = _clamp(momentum, 0.0, 25.0)
+
+    volume_price = 10.0
+    if pct is not None and volume_ratio is not None:
+        if pct > 0 and volume_ratio >= 1.2:
+            volume_price += 5.0
+        elif pct < 0 and volume_ratio >= 1.2:
+            volume_price -= 5.0
+    if breakout:
+        volume_price += 5.0
+    if failed_breakout:
+        volume_price -= 5.0
+    volume_price = _clamp(volume_price, 0.0, 20.0)
+
+    structure = 7.0
+    if position60 is not None:
+        if 0.55 <= position60 <= 0.90:
+            structure += 4.0
+        elif position60 < 0.25:
+            structure -= 3.0
+    if ma60 is not None:
+        structure += 2.0 if price > ma60 else -2.0
+    if divergence == "bearish":
+        structure -= 3.0
+    elif divergence == "bullish":
+        structure += 2.0
+    structure = _clamp(structure, 0.0, 15.0)
+
+    risk_quality = 5.0
+    if rsi is not None and rsi > 80:
+        risk_quality -= 2.0
+    if atr_pct is not None and atr_pct > 5.0:
+        risk_quality -= 2.0
+    if failed_breakout:
+        risk_quality -= 2.0
+    if divergence == "bullish":
+        risk_quality += 2.0
+    risk_quality = _clamp(risk_quality, 0.0, 10.0)
+
+    total = int(round(trend + momentum + volume_price + structure + risk_quality))
+    total = int(_clamp(total, 0, 100))
+    if total >= 75:
+        label = "强"
+    elif total >= 60:
+        label = "偏强"
+    elif total >= 40:
+        label = "震荡"
+    elif total >= 25:
+        label = "偏弱"
+    else:
+        label = "弱"
+    components = {
+        "trend": round(trend, 1),
+        "momentum": round(momentum, 1),
+        "volume_price": round(volume_price, 1),
+        "structure": round(structure, 1),
+        "risk_quality": round(risk_quality, 1),
+    }
+    return total, label, components
+
+
+def _emotion_proxy(
+    latest: pd.Series,
+    price: float,
+    trend: str,
+    breakout: bool,
+    failed_breakout: bool,
+    divergence: str | None,
+) -> dict:
+    ret20 = _num(latest.get("return_20d_pct")) or 0.0
+    position60 = _num(latest.get("position_60d"))
+    rsi = _num(latest.get("rsi14"))
+    volume_ratio = _num(latest.get("volume_ratio_20"))
+    pct = _num(latest.get("pct_change")) or 0.0
+    ma20 = _num(latest.get("ma20"))
+
+    evidence: list[str] = []
+    if failed_breakout or (divergence == "bearish" and (position60 or 0.0) > 0.75):
+        phase = "distribution_risk"
+        label = "高位分歧/派发风险"
+        evidence.append("冲高未站稳或出现价格-RSI顶背离")
+    elif ret20 >= 15 and (position60 or 0.0) >= 0.85 and (
+        (rsi or 0.0) >= 70 or (volume_ratio or 0.0) >= 1.5
+    ):
+        phase = "acceleration_crowding"
+        label = "加速/拥挤"
+        evidence.append("20日涨幅较高且价格靠近60日区间上沿")
+    elif breakout:
+        phase = "early_breakout"
+        label = "突破确认候选"
+        evidence.append("价格突破前20日高点并得到量能确认")
+    elif trend in {"强", "偏强"} and pct < 0 and (volume_ratio or 1.0) < 0.9 and (
+        ma20 is not None and price > ma20
+    ):
+        phase = "healthy_pullback"
+        label = "趋势内缩量回踩"
+        evidence.append("回落时量能收缩且价格仍在MA20上方")
+    elif (position60 or 1.0) <= 0.20 and (rsi or 100.0) <= 35:
+        phase = "panic_oversold"
+        label = "恐慌/超卖代理"
+        evidence.append("价格位于60日低位区域且RSI偏低")
+    elif ma20 is not None and price < ma20 and pct < 0 and (volume_ratio or 0.0) >= 1.2:
+        phase = "de_risking"
+        label = "去风险"
+        evidence.append("跌破MA20附近同时下跌放量")
+    elif trend in {"强", "偏强"}:
+        phase = "trend_acceptance"
+        label = "趋势接受"
+        evidence.append("价格与中期均线结构保持偏强")
+    else:
+        phase = "range_rotation"
+        label = "震荡/轮动"
+        evidence.append("趋势、动能与量价尚未形成单边共振")
+
+    crowding = "低"
+    if (rsi or 0.0) >= 75 or ret20 >= 20:
+        crowding = "高"
+    elif (rsi or 0.0) >= 65 or ret20 >= 10:
+        crowding = "中"
+    return {
+        "phase": phase,
+        "label": label,
+        "crowding_proxy": crowding,
+        "evidence": evidence,
+        "scope_note": "仅为价格/成交量情绪代理，不包含新闻、论坛或真实持仓拥挤度。",
+    }
+
+
+def _load_daily(symbol: str, lookback: int) -> tuple[list[dict], str, str, str]:
+    end_ref = dates.latest_trade_date()
+    requested = max(_MIN_LOOKBACK, min(int(lookback), _MAX_LOOKBACK))
+    trade_days = dates.recent_trade_dates(requested, ref=end_ref)
+    if trade_days:
+        start_ref = trade_days[0]
+    else:
+        start_ref = end_ref - timedelta(days=max(180, requested * 2))
+    start = start_ref.strftime("%Y-%m-%d")
+    end = end_ref.strftime("%Y-%m-%d")
+
+    try:
+        frame = call_ak(
+            "stock_zh_a_hist",
+            timeout_seconds=_DAILY_TIMEOUT_SECONDS,
+            attempts=1,
+            symbol=codes.normalize(symbol),
+            period="daily",
+            start_date=dates.to_compact(start),
+            end_date=dates.to_compact(end),
+            adjust="qfq",
+        )
+        rows = df_to_records(frame)
+        source = "akshare / 东方财富"
+    except DataSourceError:
+        rows = bs.daily_kline(symbol, start, end, "qfq")
+        source = "baostock (fallback)"
+    return rows, source, start, end
+
+
+def _realtime_overlay(symbol: str) -> tuple[dict | None, list[str]]:
+    try:
+        quotes, provider_errors = rt.realtime_quotes([symbol])
+        return quotes.get(codes.normalize(symbol)), provider_errors
+    except DataSourceError as exc:
+        return None, [str(exc)]
+
+
+@mcp.tool
+@guard
+@cached(ttl=TTL_MINUTE)
+def get_technical_analysis(
+    symbol: str,
+    lookback: int = 120,
+    include_realtime: bool = True,
+) -> dict:
+    """计算 A 股日线技术面快照，并可叠加腾讯/新浪轻量实时行情。
+
+    适合回答: 趋势强弱、均线、MACD/RSI/KDJ、量价、波动率、支撑压力、突破/回踩、
+    技术风险与验证条件。参考常见技术分析工作流，但所有结论均由可复现公式生成。
+
+    参数:
+      symbol: A股代码，支持 600519 / sh600519 / 600519.SH。
+      lookback: 日线回看交易日数量，默认120，自动限制在80-250。
+      include_realtime: 是否叠加腾讯财经实时行情；腾讯失败时自动回退新浪。
+
+    返回重点:
+      summary: 技术评分(0-100启发式)、强弱标签、当前价格与数据时间；
+      trend: MA5/10/20/60及斜率；
+      momentum: MACD、RSI14、KDJ；
+      volume_price: 量比、量价关系、突破/冲高回落识别；
+      volatility: ATR14、布林带；
+      structure: 20/60日位置、支撑/压力区；
+      emotion_proxy: 仅基于价量的情绪阶段代理；
+      signals / risk_signals / confirmation: 给上层 Agent 使用的结构化证据。
+
+    注意: technical_score 不是上涨概率，也不是买卖评级；情绪代理不包含新闻/论坛情绪。
+    """
+    if not symbol:
+        return err("bad_request", "symbol 不能为空", "示例: 600519")
+
+    sym = codes.normalize(symbol)
+    requested = max(_MIN_LOOKBACK, min(int(lookback), _MAX_LOOKBACK))
+    rows, daily_source, requested_start, requested_end = _load_daily(sym, requested)
+    df = _add_indicators(_prepare_frame(rows))
+    latest = df.iloc[-1]
+    previous = df.iloc[-2]
+
+    quote = None
+    provider_errors: list[str] = []
+    if include_realtime:
+        quote, provider_errors = _realtime_overlay(sym)
+
+    latest_close = float(latest["close"])
+    realtime_price = _num(quote.get("price")) if quote else None
+    current_price = realtime_price if realtime_price and realtime_price > 0 else latest_close
+    price_basis = "realtime_quote" if realtime_price and realtime_price > 0 else "latest_daily_close"
+
+    latest_pct = _num(latest.get("pct_change"))
+    volume_ratio = _num(latest.get("volume_ratio_20"))
+    prev20_high = _num(latest.get("prev_20d_high"))
+    breakout = bool(
+        prev20_high is not None
+        and latest_close > prev20_high
+        and volume_ratio is not None
+        and volume_ratio >= 1.3
+    )
+    failed_breakout = bool(
+        prev20_high is not None
+        and float(latest["high"]) > prev20_high
+        and latest_close < prev20_high
+    )
+    divergence = _rsi_divergence(df)
+    trend = _trend_label(latest, current_price)
+    score, score_label, score_components = _score_snapshot(
+        latest,
+        previous,
+        current_price,
+        breakout,
+        failed_breakout,
+        divergence,
+    )
+
+    atr = _num(latest.get("atr14"))
+    support, resistance = _support_resistance(df, current_price, atr)
+
+    signals: list[str] = []
+    risk_signals: list[str] = []
+    ma5 = _num(latest.get("ma5"))
+    ma10 = _num(latest.get("ma10"))
+    ma20 = _num(latest.get("ma20"))
+    ma60 = _num(latest.get("ma60"))
+    hist = _num(latest.get("macd_hist"))
+    prev_hist = _num(previous.get("macd_hist"))
+    dif = _num(latest.get("macd_dif"))
+    dea = _num(latest.get("macd_dea"))
+    prev_dif = _num(previous.get("macd_dif"))
+    prev_dea = _num(previous.get("macd_dea"))
+    rsi = _num(latest.get("rsi14"))
+
+    if all(value is not None for value in (ma5, ma10, ma20, ma60)):
+        if ma5 > ma10 > ma20 > ma60:
+            signals.append("MA5>MA10>MA20>MA60，多头均线排列")
+        elif ma5 < ma10 < ma20 < ma60:
+            risk_signals.append("MA5<MA10<MA20<MA60，空头均线排列")
+    if ma20 is not None:
+        signals.append("价格位于MA20上方") if current_price > ma20 else risk_signals.append(
+            "价格位于MA20下方"
+        )
+    if dif is not None and dea is not None and prev_dif is not None and prev_dea is not None:
+        if prev_dif <= prev_dea and dif > dea:
+            signals.append("MACD刚形成金叉")
+        elif prev_dif >= prev_dea and dif < dea:
+            risk_signals.append("MACD刚形成死叉")
+        elif hist is not None and hist > 0:
+            signals.append("MACD柱线位于零轴上方")
+        elif hist is not None and hist < 0:
+            risk_signals.append("MACD柱线位于零轴下方")
+    if hist is not None and prev_hist is not None:
+        if hist > prev_hist:
+            signals.append("MACD动能较前一交易日改善")
+        elif hist < prev_hist:
+            risk_signals.append("MACD动能较前一交易日走弱")
+    if rsi is not None:
+        if rsi >= 80:
+            risk_signals.append("RSI14>80，短线过热风险较高")
+        elif rsi <= 30:
+            signals.append("RSI14<=30，进入超卖区间但不等于见底")
+    if breakout:
+        signals.append("收盘突破前20日高点且量能>=20日均量1.3倍")
+    if failed_breakout:
+        risk_signals.append("盘中突破前20日高点但收盘跌回，存在假突破/冲高回落")
+    if divergence == "bearish":
+        risk_signals.append("近30日检测到价格-RSI顶背离")
+    elif divergence == "bullish":
+        signals.append("近30日检测到价格-RSI底背离")
+
+    volume_price = _volume_price_label(latest_pct, volume_ratio)
+    if volume_price in {"放量上涨", "缩量回踩"}:
+        signals.append(volume_price)
+    elif volume_price in {"放量下跌", "放量震荡"}:
+        risk_signals.append(volume_price)
+
+    nearest_support = support[0] if support else None
+    nearest_resistance = resistance[0] if resistance else None
+    confirmation = {
+        "strengthen": {
+            "price_level": nearest_resistance["zone"][1] if nearest_resistance else None,
+            "volume_ratio_min": 1.3,
+            "condition": (
+                "收盘有效站上最近压力区上沿，并配合至少约1.3倍20日均量"
+                if nearest_resistance
+                else "等待新高突破并观察量能是否同步放大"
+            ),
+        },
+        "weaken": {
+            "price_level": nearest_support["zone"][0] if nearest_support else None,
+            "condition": (
+                "收盘跌破最近支撑区下沿，若同时放量则弱化信号更强"
+                if nearest_support
+                else "跌破近期区间低点且放量时视为结构转弱"
+            ),
+        },
+    }
+
+    quote_payload = None
+    if quote:
+        quote_payload = {
+            "price": _num(quote.get("price")),
+            "pct_change": _num(quote.get("pct_change")),
+            "open": _num(quote.get("open")),
+            "high": _num(quote.get("high")),
+            "low": _num(quote.get("low")),
+            "volume_ratio": _num(quote.get("volume_ratio")),
+            "turnover_rate": _num(quote.get("turnover_rate")),
+            "quote_time": quote.get("quote_time"),
+            "source": quote.get("source"),
+            "provider_realtime_flag": bool(quote.get("is_realtime")),
+        }
+        if ma20:
+            quote_payload["vs_ma20_pct"] = round((current_price / ma20 - 1.0) * 100.0, 2)
+
+    latest_date = latest["date"].strftime("%Y-%m-%d")
+    data = {
+        "summary": {
+            "technical_score": score,
+            "score_label": score_label,
+            "trend": trend,
+            "price": round(current_price, 4),
+            "price_basis": price_basis,
+            "latest_completed_bar": latest_date,
+            "score_is_heuristic": True,
+            "score_components": score_components,
+        },
+        "trend": {
+            "ma5": ma5,
+            "ma10": ma10,
+            "ma20": ma20,
+            "ma60": ma60,
+            "ma20_slope_5d_pct": _num(latest.get("ma20_slope_5d_pct")),
+            "ma60_slope_5d_pct": _num(latest.get("ma60_slope_5d_pct")),
+            "return_5d_pct": _num(latest.get("return_5d_pct")),
+            "return_20d_pct": _num(latest.get("return_20d_pct")),
+            "return_60d_pct": _num(latest.get("return_60d_pct")),
+        },
+        "momentum": {
+            "macd_dif": dif,
+            "macd_dea": dea,
+            "macd_hist": hist,
+            "rsi14": rsi,
+            "kdj_k": _num(latest.get("kdj_k")),
+            "kdj_d": _num(latest.get("kdj_d")),
+            "kdj_j": _num(latest.get("kdj_j")),
+            "rsi_divergence_30d": divergence,
+        },
+        "volume_price": {
+            "classification": volume_price,
+            "latest_pct_change": latest_pct,
+            "latest_volume": _num(latest.get("volume"), 2),
+            "volume_ma5": _num(latest.get("volume_ma5"), 2),
+            "volume_ma20": _num(latest.get("volume_ma20"), 2),
+            "volume_ratio_vs_prior_20d": volume_ratio,
+            "breakout_20d_confirmed": breakout,
+            "failed_breakout_20d": failed_breakout,
+        },
+        "volatility": {
+            "atr14": atr,
+            "atr14_pct": _num(latest.get("atr14_pct")),
+            "boll_mid": _num(latest.get("boll_mid")),
+            "boll_upper": _num(latest.get("boll_upper")),
+            "boll_lower": _num(latest.get("boll_lower")),
+            "boll_width_pct": _num(latest.get("boll_width_pct")),
+        },
+        "structure": {
+            "position_20d": _num(latest.get("position_20d")),
+            "position_60d": _num(latest.get("position_60d")),
+            "prev_20d_high": _num(latest.get("prev_20d_high")),
+            "prev_20d_low": _num(latest.get("prev_20d_low")),
+            "prev_60d_high": _num(latest.get("prev_60d_high")),
+            "prev_60d_low": _num(latest.get("prev_60d_low")),
+            "support": support,
+            "resistance": resistance,
+        },
+        "emotion_proxy": _emotion_proxy(
+            latest,
+            current_price,
+            trend,
+            breakout,
+            failed_breakout,
+            divergence,
+        ),
+        "signals": list(dict.fromkeys(signals)),
+        "risk_signals": list(dict.fromkeys(risk_signals)),
+        "confirmation": confirmation,
+        "realtime": quote_payload,
+    }
+
+    return ok(
+        data,
+        symbol=sym,
+        lookback=requested,
+        bars=len(df),
+        requested_window={"start": requested_start, "end": requested_end},
+        actual_window={
+            "start": df.iloc[0]["date"].strftime("%Y-%m-%d"),
+            "end": latest_date,
+        },
+        source={
+            "daily": daily_source,
+            "realtime": quote.get("source") if quote else None,
+        },
+        provider_errors=provider_errors,
+        methodology=(
+            "MA/MACD/RSI/KDJ/BOLL/ATR + 量价 + 20/60日结构 + 摆动高低点；"
+            "技术评分和情绪阶段为启发式解释，不是收益概率。"
+        ),
+        note=DISCLAIMER_NOT_ADVICE,
+    )
