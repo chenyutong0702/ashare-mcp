@@ -19,7 +19,7 @@ def test_parse_tencent_quote():
     assert row["pct_change"] == 2.35
     assert row["quote_time"] == "2026-06-10 16:14:26"
     assert row["amount"] == 1046292201.0
-    assert row["volume"] == 109903500.0
+    assert row["volume"] == 1099035.0
     assert row["turnover_rate"] == 0.33
     assert row["pe_ttm"] == 6.35
     assert row["amplitude"] == 2.67
@@ -30,7 +30,7 @@ def test_parse_tencent_quote():
     assert row["limit_down"] == 8.43
     assert row["volume_ratio"] == 1.56
     assert row["bid_ask"]["bid_1"] == 9.58
-    assert row["bid_ask"]["bid_1_vol"] == 50400.0
+    assert row["bid_ask"]["bid_1_vol"] == 504.0
     assert row["bid_ask"]["ask_1"] == 9.59
     assert row["source"] == "Tencent Finance"
 
@@ -49,10 +49,11 @@ def test_parse_sina_quote():
     assert row["open"] == 38.10
     assert row["high"] == 38.50
     assert row["low"] == 37.80
-    assert row["volume"] == 35953534.0
+    assert row["volume"] == 359535.34
     assert row["amount"] == 1370335108.0
     assert row["quote_time"] == "2019-12-27 15:00:00"
     assert row["bid_ask"]["bid_1"] == 37.85
+    assert row["bid_ask"]["bid_1_vol"] == 267.0
     assert row["bid_ask"]["ask_1"] == 37.86
     assert row["source"] == "Sina Finance"
 
