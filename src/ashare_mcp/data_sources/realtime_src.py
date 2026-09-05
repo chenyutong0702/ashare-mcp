@@ -53,9 +53,9 @@ def _field(fields: list[str], index: int) -> str | None:
     return fields[index].strip() if 0 <= index < len(fields) else None
 
 
-def _shares_from_hands(value: str | None) -> float | None:
+def _shares_to_hands(value: str | None) -> float | None:
     number = _float(value)
-    return number * 100 if number is not None else None
+    return number / 100 if number is not None else None
 
 
 def _format_tencent_time(raw: str | None) -> str | None:
@@ -94,9 +94,9 @@ def _tencent_bid_ask(fields: list[str]) -> dict:
         ask_price_index = 19 + (level - 1) * 2
         ask_volume_index = ask_price_index + 1
         out[f"bid_{level}"] = _float(_field(fields, bid_price_index))
-        out[f"bid_{level}_vol"] = _shares_from_hands(_field(fields, bid_volume_index))
+        out[f"bid_{level}_vol"] = _float(_field(fields, bid_volume_index))
         out[f"ask_{level}"] = _float(_field(fields, ask_price_index))
-        out[f"ask_{level}_vol"] = _shares_from_hands(_field(fields, ask_volume_index))
+        out[f"ask_{level}_vol"] = _float(_field(fields, ask_volume_index))
     return out
 
 
@@ -133,7 +133,7 @@ def _parse_tencent(text: str) -> dict[str, dict]:
             "high": _float(_field(fields, 33)),
             "low": _float(_field(fields, 34)),
             "prev_close": prev_close,
-            "volume": _shares_from_hands(_field(fields, 6)),
+            "volume": _float(_field(fields, 6)),  # hands, same convention as Eastmoney spot
             "amount": _amount_from_tencent(fields),
             "turnover_rate": _float(_field(fields, 38)),
             "volume_ratio": _float(_field(fields, 49)),
@@ -154,17 +154,17 @@ def _parse_tencent(text: str) -> dict[str, dict]:
 
 def _sina_bid_ask(fields: list[str]) -> dict:
     out: dict[str, float | None] = {}
-    # Sina: 10/11 = bid1 volume/price ... 18/19 = bid5 volume/price
-    #       20/21 = ask1 volume/price ... 28/29 = ask5 volume/price
+    # Sina bid/ask volumes are shares; convert to hands to match the Tencent/Eastmoney
+    # convention used by the existing A-share tool output.
     for level in range(1, 6):
         bid_volume_index = 10 + (level - 1) * 2
         bid_price_index = bid_volume_index + 1
         ask_volume_index = 20 + (level - 1) * 2
         ask_price_index = ask_volume_index + 1
         out[f"bid_{level}"] = _float(_field(fields, bid_price_index))
-        out[f"bid_{level}_vol"] = _float(_field(fields, bid_volume_index))
+        out[f"bid_{level}_vol"] = _shares_to_hands(_field(fields, bid_volume_index))
         out[f"ask_{level}"] = _float(_field(fields, ask_price_index))
-        out[f"ask_{level}_vol"] = _float(_field(fields, ask_volume_index))
+        out[f"ask_{level}_vol"] = _shares_to_hands(_field(fields, ask_volume_index))
     return out
 
 
@@ -190,6 +190,8 @@ def _parse_sina(text: str) -> dict[str, dict]:
         quote_clock = _field(fields, 31)
         quote_time = " ".join(x for x in (quote_date, quote_clock) if x) or None
 
+        high = _float(_field(fields, 4))
+        low = _float(_field(fields, 5))
         quotes[code] = {
             "code": code,
             "name": _field(fields, 0) or None,
@@ -197,10 +199,10 @@ def _parse_sina(text: str) -> dict[str, dict]:
             "pct_change": pct_change,
             "change": change,
             "open": _float(_field(fields, 1)),
-            "high": _float(_field(fields, 4)),
-            "low": _float(_field(fields, 5)),
+            "high": high,
+            "low": low,
             "prev_close": prev_close,
-            "volume": _float(_field(fields, 8)),  # shares
+            "volume": _shares_to_hands(_field(fields, 8)),
             "amount": _float(_field(fields, 9)),  # yuan
             "turnover_rate": None,
             "volume_ratio": None,
@@ -209,11 +211,8 @@ def _parse_sina(text: str) -> dict[str, dict]:
             "total_market_cap": None,
             "float_market_cap": None,
             "amplitude": (
-                (( _float(_field(fields, 4)) or 0) - (_float(_field(fields, 5)) or 0))
-                / prev_close * 100
-                if prev_close not in {None, 0}
-                and _float(_field(fields, 4)) is not None
-                and _float(_field(fields, 5)) is not None
+                (high - low) / prev_close * 100
+                if high is not None and low is not None and prev_close not in {None, 0}
                 else None
             ),
             "limit_up": None,
