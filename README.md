@@ -240,3 +240,27 @@ tail -f ~/.ashare-mcp/logs/launchd.err.log       # 看启动 banner / 日志
 ## 13. 许可证
 
 本项目以 [MIT License](LICENSE) 开源。© 2026 CharmYue
+
+## Unified technical and sentiment tool
+
+`technical_sentiment_analysis(symbol, period="daily", lookback=120)` adds one tool to
+this server. Existing tools retain their names and signatures. `period` currently
+accepts only `daily`; `lookback` is an integer from 80 to 250 trading days.
+
+Example Dify arguments: `{"symbol":"600460.SH","period":"daily","lookback":120}`.
+After deploying this revision, refresh the existing MCP provider in Dify; no second
+service or new URL is needed.
+
+The normal `ok/data` response contains:
+- `technical`: existing MA/EMA, MACD, RSI, KDJ, BOLL, ATR, ADX, OBV, volume-price,
+  support/resistance, crossovers, overbought/oversold, trend and risk details.
+- `sentiment`: activity versus prior 20-day volume (not intraday volume ratio),
+  separately timestamped quote volume ratio/turnover, date-aligned main fund flow,
+  daily percentage change, short-term label and explicit score components.
+- `technical_score`, `sentiment_score`, `overall_signal`, `summary`, `risk_flags`.
+
+Scores are descriptive heuristics, not probabilities. Sentiment averages available
+price-strength and fund-flow-sign components; unavailable inputs are excluded, and
+all-missing scores are null. Fund flow on a different date is unavailable, never zero.
+Real-time quote values are shown separately and do not affect daily scoring.
+The sentiment scope is the individual stock, not news sentiment or market-wide breadth.
