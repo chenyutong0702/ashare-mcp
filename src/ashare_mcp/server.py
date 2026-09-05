@@ -29,6 +29,7 @@ from .tools import (  # noqa: F401  (imported for side effects)
     market,
     meta,
     search_fetch,
+    technical,
 )
 
 MCP_PATH = "/mcp"
